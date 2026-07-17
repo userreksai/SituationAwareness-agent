@@ -1,0 +1,8 @@
+.env
+.source-downloads/
+.tools/
+.work/
+bin/
+coverage.out
+*.exe
+*.log

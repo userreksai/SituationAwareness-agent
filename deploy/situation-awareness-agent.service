@@ -1,0 +1,20 @@
+[Unit]
+Description=Situation Awareness Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=situation-awareness
+Group=situation-awareness
+EnvironmentFile=/etc/situation-awareness-agent.env
+ExecStart=/opt/situation-awareness-agent/situation-awareness-agent
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
