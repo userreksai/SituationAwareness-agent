@@ -1,6 +1,6 @@
 # SituationAwareness Agent
 
-态势感知拨测节点。Agent 默认监听 `8002`，接收 Master 下发的结构化探测任务，执行 DNS、TCP 和 HTTP 探测后返回结果。
+态势感知拨测节点。Agent 默认监听 `8002`，接收 Master 下发的结构化任务，执行 DNS、TCP、HTTP 探测或 TLS 证书读取后返回结果。
 
 Agent **不会执行任意 Shell 命令**。这可以避免公网节点因参数拼接或接口泄漏变成远程命令执行入口。
 
@@ -33,6 +33,20 @@ curl -X POST http://127.0.0.1:8002/api/v1/tasks \
   }'
 ```
 
+读取域名证书：
+
+```bash
+curl -X POST http://127.0.0.1:8002/api/v1/tasks \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer replace-with-a-long-random-token' \
+  -d '{
+    "taskId": "certificate-001",
+    "type": "certificate",
+    "target": "example.com",
+    "options": {"timeoutMs": 15000}
+  }'
+```
+
 ## 配置参数
 
 | 参数 | 默认值 | 说明 |
@@ -49,9 +63,10 @@ curl -X POST http://127.0.0.1:8002/api/v1/tasks \
 ## API 契约
 
 - `GET /healthz`：进程健康状态。
-- `POST /api/v1/tasks`：执行任务。当前只支持 `type=probe`。
+- `POST /api/v1/tasks`：执行任务。支持 `type=probe` 和 `type=certificate`。
 - 请求体最大 64 KiB；端口最多 10 个；任务超时不能超过 `AGENT_MAX_TIMEOUT`。
 - 合法任务即使目标不可达也返回 HTTP 200，并通过 `result.available=false` 和各步骤的 `error` 描述探测结果。参数错误、未授权或节点繁忙分别返回 400、401、429。
+- `certificate` 任务默认读取目标的 443 端口，也可通过 `options.ports` 指定一个测试端口；结果位于 `result.certificate`，包含证书有效期、SAN、域名匹配状态、实际连接地址和错误信息。
 
 ## 验证与构建
 

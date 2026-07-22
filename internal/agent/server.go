@@ -66,7 +66,7 @@ func (h *handler) tasks(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	response, err := runProbe(request.Context(), h.cfg, task)
+	response, err := runTask(request.Context(), h.cfg, task)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_task", err.Error())
 		return

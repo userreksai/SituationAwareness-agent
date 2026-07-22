@@ -50,11 +50,12 @@ type AgentInfo struct {
 }
 
 type ProbeResult struct {
-	NormalizedTarget string       `json:"normalizedTarget"`
-	Available        bool         `json:"available"`
-	DNS              DNSResult    `json:"dns"`
-	TCP              []TCPResult  `json:"tcp"`
-	HTTP             []HTTPResult `json:"http"`
+	NormalizedTarget string             `json:"normalizedTarget"`
+	Available        bool               `json:"available"`
+	DNS              DNSResult          `json:"dns,omitempty"`
+	TCP              []TCPResult        `json:"tcp,omitempty"`
+	HTTP             []HTTPResult       `json:"http,omitempty"`
+	Certificate      *CertificateResult `json:"certificate,omitempty"`
 }
 
 type DNSResult struct {
@@ -86,11 +87,27 @@ type targetSpec struct {
 	httpCandidates []string
 }
 
-func runProbe(parent context.Context, cfg Config, request TaskRequest) (TaskResponse, error) {
-	spec, timeout, err := validateTask(cfg, &request)
+func runTask(parent context.Context, cfg Config, request TaskRequest) (TaskResponse, error) {
+	timeout, err := validateTask(cfg, &request)
 	if err != nil {
 		return TaskResponse{}, err
 	}
+	switch request.Type {
+	case "probe":
+		spec, specErr := normalizeTarget(request.Target, request.Options.Ports)
+		if specErr != nil {
+			return TaskResponse{}, specErr
+		}
+		request.Target = strings.TrimSpace(request.Target)
+		return runProbe(parent, cfg, request, spec, timeout), nil
+	case "certificate":
+		return runCertificate(parent, cfg, request, timeout)
+	default:
+		return TaskResponse{}, fmt.Errorf("type must be probe or certificate")
+	}
+}
+
+func runProbe(parent context.Context, cfg Config, request TaskRequest, spec targetSpec, timeout time.Duration) TaskResponse {
 
 	started := time.Now().UTC()
 	ctx, cancel := context.WithTimeout(parent, timeout)
@@ -133,41 +150,35 @@ func runProbe(parent context.Context, cfg Config, request TaskRequest) (TaskResp
 		FinishedAt: finished,
 		DurationMS: finished.Sub(started).Milliseconds(),
 		Result:     result,
-	}, nil
+	}
 }
 
 var osHostname = os.Hostname
 
-func validateTask(cfg Config, request *TaskRequest) (targetSpec, time.Duration, error) {
+func validateTask(cfg Config, request *TaskRequest) (time.Duration, error) {
 	request.TaskID = strings.TrimSpace(request.TaskID)
 	if request.TaskID == "" {
 		request.TaskID = newTaskID()
 	}
 	if len(request.TaskID) > 128 {
-		return targetSpec{}, 0, fmt.Errorf("taskId must be at most 128 characters")
+		return 0, fmt.Errorf("taskId must be at most 128 characters")
 	}
 	request.Type = strings.ToLower(strings.TrimSpace(request.Type))
-	if request.Type != "probe" {
-		return targetSpec{}, 0, fmt.Errorf("type must be probe")
+	if request.Type != "probe" && request.Type != "certificate" {
+		return 0, fmt.Errorf("type must be probe or certificate")
 	}
 
 	timeout := cfg.DefaultTimeout
 	if request.Options.TimeoutMS != 0 {
 		if request.Options.TimeoutMS < 500 {
-			return targetSpec{}, 0, fmt.Errorf("options.timeoutMs must be at least 500")
+			return 0, fmt.Errorf("options.timeoutMs must be at least 500")
 		}
 		timeout = time.Duration(request.Options.TimeoutMS) * time.Millisecond
 	}
 	if timeout > cfg.MaxTimeout {
-		return targetSpec{}, 0, fmt.Errorf("options.timeoutMs exceeds the configured maximum")
+		return 0, fmt.Errorf("options.timeoutMs exceeds the configured maximum")
 	}
-
-	spec, err := normalizeTarget(request.Target, request.Options.Ports)
-	if err != nil {
-		return targetSpec{}, 0, err
-	}
-	request.Target = strings.TrimSpace(request.Target)
-	return spec, timeout, nil
+	return timeout, nil
 }
 
 func normalizeTarget(raw string, requestedPorts []int) (targetSpec, error) {
