@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -117,5 +118,49 @@ func TestTaskHandlerRejectsUnknownParameters(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status=%d", response.StatusCode)
+	}
+}
+
+func TestCertificateTaskHandler(t *testing.T) {
+	t.Parallel()
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+	port := target.Listener.Addr().(*net.TCPAddr).Port
+
+	server := httptest.NewServer(NewHandler(testConfig(), log.New(io.Discard, "", 0)))
+	defer server.Close()
+	payload, _ := json.Marshal(TaskRequest{
+		TaskID: "certificate-1",
+		Type:   "certificate",
+		Target: "127.0.0.1",
+		Options: ProbeOptions{
+			TimeoutMS: 2000,
+			Ports:     []int{port},
+		},
+	})
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/tasks", bytes.NewReader(payload))
+	request.Header.Set("Authorization", "Bearer test-token")
+	request.Header.Set("Content-Type", "application/json")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("certificate request failed: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("certificate status=%d body=%s", response.StatusCode, body)
+	}
+	var result TaskResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatalf("decode certificate response: %v", err)
+	}
+	if !result.Result.Available || result.Result.Certificate == nil {
+		t.Fatalf("unexpected certificate result: %+v", result.Result)
+	}
+	if result.Result.Certificate.ExpiresAt == nil || result.Result.Certificate.ResolvedAddress == "" {
+		t.Fatalf("missing certificate details: %+v", result.Result.Certificate)
 	}
 }
