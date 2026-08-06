@@ -1,32 +1,50 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# SituationAwareness Agent Docker deployment script.
-# Run on a Linux node that already has Docker installed:
-#   sudo bash install-agent-docker.sh
+# Outbound-only SituationAwareness Agent Docker deployment.
+# The Agent opens no host port and connects to Master itself.
 #
-# Optional non-secret overrides:
-#   sudo env AGENT_NAME=node-bj-01 HOST_PORT=8002 BIND_ADDRESS=0.0.0.0 \
+# First deployment:
+#   sudo env MASTER_HOST=10.0.0.10 AGENT_NAME=node-bj-01 \
 #     bash install-agent-docker.sh
 #
-# For unattended deployment, provide secrets through protected files:
-#   sudo env \
-#     DOCKERHUB_TOKEN_FILE=/run/secrets/dockerhub_pull_token \
-#     AGENT_SHARED_TOKEN_FILE=/run/secrets/agent_shared_token \
-#     bash install-agent-docker.sh
+# Optional secret files for unattended deployment:
+#   DOCKERHUB_TOKEN_FILE=/run/secrets/dockerhub_pull_token
+#   AGENT_SHARED_TOKEN_FILE=/run/secrets/agent_shared_token
 
-IMAGE_REF="${IMAGE_REF:-beiou/situationawareness-agent:1.0.0}"
+IMAGE_REF="${IMAGE_REF:-beiou/situationawareness-agent:1.1.0}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-beiou}"
 CONTAINER_NAME="${CONTAINER_NAME:-situation-awareness-agent}"
+ROLLBACK_CONTAINER="${ROLLBACK_CONTAINER:-${CONTAINER_NAME}-rollback}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/situation-awareness-agent}"
 ENV_FILE="${ENV_FILE:-${CONFIG_DIR}/agent.env}"
-BIND_ADDRESS="${BIND_ADDRESS:-0.0.0.0}"
-HOST_PORT="${HOST_PORT:-8002}"
-AGENT_NAME="${AGENT_NAME:-$(hostname -f 2>/dev/null || hostname)}"
+MASTER_PORT="${MASTER_PORT:-9910}"
+MASTER_CONNECT_PATH="${MASTER_CONNECT_PATH:-/api/v1/agent/connect}"
 AGENT_MAX_CONCURRENT="${AGENT_MAX_CONCURRENT:-8}"
 AGENT_DEFAULT_TIMEOUT="${AGENT_DEFAULT_TIMEOUT:-10s}"
 AGENT_MAX_TIMEOUT="${AGENT_MAX_TIMEOUT:-30s}"
+AGENT_RECONNECT_MIN="${AGENT_RECONNECT_MIN:-1s}"
+AGENT_RECONNECT_MAX="${AGENT_RECONNECT_MAX:-30s}"
+AGENT_HEARTBEAT_INTERVAL="${AGENT_HEARTBEAT_INTERVAL:-20s}"
+WAIT_FOR_REGISTRATION="${WAIT_FOR_REGISTRATION:-false}"
 CONTAINER_LABEL="com.situation-awareness.service=agent"
+docker_extra_args=()
+previous_available=false
+
+restore_previous_on_error() {
+  local exit_code="$?"
+  trap - ERR
+  set +e
+  if [[ "$previous_available" == "true" ]]; then
+    printf '[deploy] new deployment failed; restoring previous container\n' >&2
+    docker container rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    docker container rename "$ROLLBACK_CONTAINER" "$CONTAINER_NAME" >/dev/null 2>&1
+    docker container start "$CONTAINER_NAME" >/dev/null 2>&1
+  fi
+  exit "$exit_code"
+}
+
+trap restore_previous_on_error ERR
 
 log() {
   printf '[deploy] %s\n' "$*"
@@ -34,7 +52,7 @@ log() {
 
 fail() {
   printf '[deploy] ERROR: %s\n' "$*" >&2
-  exit 1
+  return 1
 }
 
 require_command() {
@@ -45,9 +63,15 @@ read_secret_file() {
   local path="$1"
   [[ -r "$path" ]] || fail "secret file is not readable: $path"
   local value
-  value="$(tr -d '\r\n' < "$path")"
+  value="$(tr -d '\r\n' <"$path")"
   [[ -n "$value" ]] || fail "secret file is empty: $path"
   printf '%s' "$value"
+}
+
+read_existing_value() {
+  local key="$1"
+  [[ -r "$ENV_FILE" ]] || return 0
+  sed -n "s/^${key}=//p" "$ENV_FILE" | tail -n 1
 }
 
 validate_no_whitespace() {
@@ -57,17 +81,6 @@ validate_no_whitespace() {
   [[ "$value" != *[[:space:]]* ]] || fail "$name must not contain whitespace"
 }
 
-health_request() {
-  local url="$1"
-  if command -v curl >/dev/null 2>&1; then
-    curl --fail --silent --show-error --max-time 3 "$url"
-  elif command -v wget >/dev/null 2>&1; then
-    wget --quiet --timeout=3 --output-document=- "$url"
-  else
-    return 127
-  fi
-}
-
 if [[ "${EUID}" -ne 0 ]]; then
   fail "run this script as root, for example: sudo bash $0"
 fi
@@ -75,20 +88,34 @@ fi
 require_command docker
 require_command hostname
 require_command install
+require_command sed
+require_command tail
 require_command tr
 require_command grep
-
-if ! command -v curl >/dev/null 2>&1 &&
-  ! command -v wget >/dev/null 2>&1; then
-  fail "curl or wget is required for the health check"
-fi
-
 docker info >/dev/null 2>&1 || fail "Docker daemon is not running or is not accessible"
 
-[[ "$HOST_PORT" =~ ^[0-9]+$ ]] || fail "HOST_PORT must be numeric"
-(( HOST_PORT >= 1 && HOST_PORT <= 65535 )) || fail "HOST_PORT must be between 1 and 65535"
-[[ "$BIND_ADDRESS" =~ ^[0-9.]+$ ]] || fail "BIND_ADDRESS must be an IPv4 address"
+[[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || fail "MASTER_PORT must be numeric"
+((MASTER_PORT >= 1 && MASTER_PORT <= 65535)) || fail "MASTER_PORT must be between 1 and 65535"
+[[ "$MASTER_CONNECT_PATH" == /* ]] || fail "MASTER_CONNECT_PATH must start with /"
+[[ "$WAIT_FOR_REGISTRATION" == "true" || "$WAIT_FOR_REGISTRATION" == "false" ]] ||
+  fail "WAIT_FOR_REGISTRATION must be true or false"
+
+existing_master_url="$(read_existing_value AGENT_MASTER_URL)"
+existing_agent_name="$(read_existing_value AGENT_NAME)"
+existing_agent_token="$(read_existing_value AGENT_SHARED_TOKEN)"
+
+AGENT_NAME="${AGENT_NAME:-${existing_agent_name:-$(hostname -f 2>/dev/null || hostname)}}"
 validate_no_whitespace "AGENT_NAME" "$AGENT_NAME"
+
+AGENT_MASTER_URL="${AGENT_MASTER_URL:-$existing_master_url}"
+if [[ -z "$AGENT_MASTER_URL" ]]; then
+  MASTER_HOST="${MASTER_HOST:-}"
+  validate_no_whitespace "MASTER_HOST" "$MASTER_HOST"
+  AGENT_MASTER_URL="ws://${MASTER_HOST}:${MASTER_PORT}${MASTER_CONNECT_PATH}"
+fi
+validate_no_whitespace "AGENT_MASTER_URL" "$AGENT_MASTER_URL"
+[[ "$AGENT_MASTER_URL" == ws://* || "$AGENT_MASTER_URL" == wss://* ]] ||
+  fail "AGENT_MASTER_URL must start with ws:// or wss://"
 
 DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:-}"
 if [[ -n "${DOCKERHUB_TOKEN_FILE:-}" ]]; then
@@ -107,29 +134,63 @@ unset DOCKERHUB_TOKEN
 AGENT_SHARED_TOKEN="${AGENT_SHARED_TOKEN:-}"
 if [[ -n "${AGENT_SHARED_TOKEN_FILE:-}" ]]; then
   AGENT_SHARED_TOKEN="$(read_secret_file "$AGENT_SHARED_TOKEN_FILE")"
+elif [[ -z "$AGENT_SHARED_TOKEN" && -n "$existing_agent_token" ]]; then
+  AGENT_SHARED_TOKEN="$existing_agent_token"
+  log "reusing the existing per-node Agent token"
 elif [[ -z "$AGENT_SHARED_TOKEN" ]]; then
   require_command od
   AGENT_SHARED_TOKEN="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \r\n')"
-  log "generated a unique Agent API token"
+  log "generated a new per-node Agent token"
 fi
 validate_no_whitespace "AGENT_SHARED_TOKEN" "$AGENT_SHARED_TOKEN"
-(( ${#AGENT_SHARED_TOKEN} >= 32 )) ||
+((${#AGENT_SHARED_TOKEN} >= 32)) ||
   fail "AGENT_SHARED_TOKEN must contain at least 32 characters"
 
 log "pulling ${IMAGE_REF}"
 docker pull "$IMAGE_REF"
 
 install -d -m 0700 "$CONFIG_DIR"
+container_tls_ca_file=""
+if [[ -n "${MASTER_CA_FILE:-}" ]]; then
+  [[ "$AGENT_MASTER_URL" == wss://* ]] || fail "MASTER_CA_FILE requires a wss:// AGENT_MASTER_URL"
+  [[ -r "$MASTER_CA_FILE" ]] || fail "MASTER_CA_FILE is not readable: $MASTER_CA_FILE"
+  install -m 0444 "$MASTER_CA_FILE" "$CONFIG_DIR/master-ca.pem"
+  container_tls_ca_file="/run/secrets/master-ca.pem"
+  docker_extra_args+=(
+    --mount "type=bind,src=${CONFIG_DIR}/master-ca.pem,dst=${container_tls_ca_file},readonly"
+  )
+fi
 install -m 0600 /dev/null "$ENV_FILE"
 {
-  printf 'AGENT_LISTEN_ADDR=:8002\n'
+  printf 'AGENT_MASTER_URL=%s\n' "$AGENT_MASTER_URL"
   printf 'AGENT_NAME=%s\n' "$AGENT_NAME"
   printf 'AGENT_SHARED_TOKEN=%s\n' "$AGENT_SHARED_TOKEN"
   printf 'AGENT_MAX_CONCURRENT=%s\n' "$AGENT_MAX_CONCURRENT"
   printf 'AGENT_DEFAULT_TIMEOUT=%s\n' "$AGENT_DEFAULT_TIMEOUT"
   printf 'AGENT_MAX_TIMEOUT=%s\n' "$AGENT_MAX_TIMEOUT"
-} > "$ENV_FILE"
-unset AGENT_SHARED_TOKEN
+  printf 'AGENT_RECONNECT_MIN=%s\n' "$AGENT_RECONNECT_MIN"
+  printf 'AGENT_RECONNECT_MAX=%s\n' "$AGENT_RECONNECT_MAX"
+  printf 'AGENT_HEARTBEAT_INTERVAL=%s\n' "$AGENT_HEARTBEAT_INTERVAL"
+  if [[ -n "$container_tls_ca_file" ]]; then
+    printf 'AGENT_TLS_CA_FILE=%s\n' "$container_tls_ca_file"
+  fi
+  if [[ -n "${AGENT_TLS_SERVER_NAME:-}" ]]; then
+    printf 'AGENT_TLS_SERVER_NAME=%s\n' "$AGENT_TLS_SERVER_NAME"
+  fi
+} >"$ENV_FILE"
+unset AGENT_SHARED_TOKEN existing_agent_token
+
+if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
+  rollback_label="$(
+    docker container inspect \
+      --format '{{ index .Config.Labels "com.situation-awareness.service" }}' \
+      "$ROLLBACK_CONTAINER"
+  )"
+  [[ "$rollback_label" == "agent" ]] ||
+    fail "container ${ROLLBACK_CONTAINER} exists but is not managed by this script"
+  log "removing the previous rollback container"
+  docker container rm --force "$ROLLBACK_CONTAINER" >/dev/null
+fi
 
 if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   existing_label="$(
@@ -139,11 +200,13 @@ if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
   )"
   [[ "$existing_label" == "agent" ]] ||
     fail "container ${CONTAINER_NAME} exists but is not managed by this script"
-  log "replacing existing container ${CONTAINER_NAME}"
-  docker container rm --force "$CONTAINER_NAME" >/dev/null
+  log "preserving existing container as ${ROLLBACK_CONTAINER}"
+  docker container rename "$CONTAINER_NAME" "$ROLLBACK_CONTAINER"
+  previous_available=true
+  docker container stop "$ROLLBACK_CONTAINER" >/dev/null
 fi
 
-log "starting ${CONTAINER_NAME} on ${BIND_ADDRESS}:${HOST_PORT}"
+log "starting ${CONTAINER_NAME}; no host port will be published"
 docker run --detach \
   --name "$CONTAINER_NAME" \
   --restart unless-stopped \
@@ -156,46 +219,46 @@ docker run --detach \
   --log-opt max-size=10m \
   --log-opt max-file=3 \
   --env-file "$ENV_FILE" \
-  --publish "${BIND_ADDRESS}:${HOST_PORT}:8002" \
   --label "$CONTAINER_LABEL" \
+  "${docker_extra_args[@]}" \
   "$IMAGE_REF" >/dev/null
 
-health_host="$BIND_ADDRESS"
-if [[ "$BIND_ADDRESS" == "0.0.0.0" ]]; then
-  health_host="127.0.0.1"
-fi
-health_url="http://${health_host}:${HOST_PORT}/healthz"
-
-log "waiting for ${health_url}"
-health_response=""
-for ((attempt = 1; attempt <= 30; attempt++)); do
-  if health_response="$(health_request "$health_url" 2>/dev/null)"; then
-    break
-  fi
-  if ! docker container inspect \
-    --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null |
-    grep -qx true; then
-    break
-  fi
-  sleep 1
-done
-
-if [[ -z "$health_response" ]]; then
+sleep 2
+running="$(docker container inspect --format '{{.State.Running}}' "$CONTAINER_NAME")"
+if [[ "$running" != "true" ]]; then
   docker container logs --tail 100 "$CONTAINER_NAME" >&2 || true
-  fail "Agent did not pass its health check"
+  fail "Agent container is not running"
 fi
 
-log "health check passed: ${health_response}"
-log "container: ${CONTAINER_NAME}"
-log "image: ${IMAGE_REF}"
+registered=false
+if [[ "$WAIT_FOR_REGISTRATION" == "true" ]]; then
+  log "waiting for Master registration"
+  for ((attempt = 1; attempt <= 30; attempt++)); do
+    if docker container logs "$CONTAINER_NAME" 2>&1 |
+      grep -q 'registered by Master as agent_id='; then
+      registered=true
+      break
+    fi
+    sleep 1
+  done
+fi
+
+log "container is running"
+log "Master endpoint: ${AGENT_MASTER_URL}"
 log "configuration: ${ENV_FILE}"
+log "no Docker port mapping was created"
 log "view logs: docker logs --tail 100 ${CONTAINER_NAME}"
-log "read the Agent API token locally with:"
+log "read the per-node token locally with:"
 printf "  sed -n 's/^AGENT_SHARED_TOKEN=//p' %q\n" "$ENV_FILE"
 
-if [[ "$BIND_ADDRESS" == "0.0.0.0" ]]; then
-  printf '\n'
-  printf '[deploy] SECURITY WARNING: TCP %s is published on every host interface.\n' "$HOST_PORT"
-  printf '[deploy] Allow this port only from the Master public IP in the cloud firewall/security group.\n'
-  printf '[deploy] The current Agent endpoint is HTTP; use an HTTPS reverse proxy for production traffic.\n'
+if [[ "$WAIT_FOR_REGISTRATION" == "true" && "$registered" != "true" ]]; then
+  printf '\n[deploy] WARNING: Agent is running but Master has not registered it yet.\n'
 fi
+printf '[deploy] Add or update this node in node_registry_manager with the exact Agent name and token.\n'
+printf '[deploy] Ensure this machine can reach the Master IP on TCP %s.\n' "$MASTER_PORT"
+if [[ "$previous_available" == "true" ]]; then
+  printf '[deploy] Previous container retained as %s for manual rollback.\n' "$ROLLBACK_CONTAINER"
+  printf '[deploy] Rollback: docker rm -f %s && docker rename %s %s && docker start %s\n' \
+    "$CONTAINER_NAME" "$ROLLBACK_CONTAINER" "$CONTAINER_NAME" "$CONTAINER_NAME"
+fi
+trap - ERR

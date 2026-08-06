@@ -7,5 +7,4 @@ RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/situati
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /out/situation-awareness-agent /usr/local/bin/situation-awareness-agent
-EXPOSE 8002
 ENTRYPOINT ["/usr/local/bin/situation-awareness-agent"]
