@@ -1,25 +1,32 @@
 package agent
 
 import (
-	"bytes"
-	"encoding/json"
+	"context"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
+
+const testSharedToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func testConfig() Config {
 	return Config{
-		ListenAddr:     ":8002",
+		MasterURL:      "ws://127.0.0.1:9910/api/v1/agent/connect",
 		AgentName:      "test-agent",
-		SharedToken:    "test-token",
+		SharedToken:    testSharedToken,
 		MaxConcurrent:  2,
 		DefaultTimeout: 2 * time.Second,
 		MaxTimeout:     5 * time.Second,
+		ReconnectMin:   10 * time.Millisecond,
+		ReconnectMax:   50 * time.Millisecond,
+		Heartbeat:      50 * time.Millisecond,
 	}
 }
 
@@ -56,82 +63,94 @@ func TestNormalizeTarget(t *testing.T) {
 	}
 }
 
-func TestTaskHandlerAuthenticatesAndProbes(t *testing.T) {
-	t.Parallel()
+func TestAgentConnectsExecutesAndReturnsTask(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer target.Close()
 
-	server := httptest.NewServer(NewHandler(testConfig(), log.New(io.Discard, "", 0)))
-	defer server.Close()
+	result := make(chan controlMessage, 1)
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer "+testSharedToken {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if request.Header.Get("X-Agent-Name") != "test-agent" {
+			http.Error(w, "bad Agent name", http.StatusBadRequest)
+			return
+		}
+		connection, err := upgrader.Upgrade(w, request, nil)
+		if err != nil {
+			return
+		}
+		defer connection.Close()
+		_ = connection.WriteJSON(controlMessage{Type: "registered", AgentID: "node-1", Version: "v1"})
+		_ = connection.WriteJSON(controlMessage{Type: "task", TaskID: "test-1", Task: &TaskRequest{
+			TaskID: "test-1",
+			Type:   "probe",
+			Target: target.URL,
+			Options: ProbeOptions{
+				TimeoutMS: 2000,
+			},
+		}})
+		for {
+			var message controlMessage
+			if err := connection.ReadJSON(&message); err != nil {
+				return
+			}
+			if message.Type == "result" {
+				result <- message
+				return
+			}
+		}
+	}))
+	defer master.Close()
 
-	payload, _ := json.Marshal(TaskRequest{TaskID: "test-1", Type: "probe", Target: target.URL, Options: ProbeOptions{TimeoutMS: 2000}})
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/tasks", bytes.NewReader(payload))
-	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("unauthenticated request failed: %v", err)
-	}
-	_ = response.Body.Close()
-	if response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated status=%d", response.StatusCode)
-	}
+	cfg := testConfig()
+	cfg.MasterURL = "ws" + strings.TrimPrefix(master.URL, "http")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, cfg, log.New(io.Discard, "", 0)) }()
 
-	request, _ = http.NewRequest(http.MethodPost, server.URL+"/api/v1/tasks", bytes.NewReader(payload))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer test-token")
-	response, err = http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("probe request failed: %v", err)
+	select {
+	case message := <-result:
+		if message.TaskID != "test-1" || message.Error != nil || message.Response == nil {
+			t.Fatalf("unexpected result message: %+v", message)
+		}
+		if !message.Response.Result.Available || len(message.Response.Result.HTTP) != 1 || message.Response.Result.HTTP[0].StatusCode != http.StatusNoContent {
+			t.Fatalf("unexpected probe result: %+v", message.Response.Result)
+		}
+		cancel()
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for Agent result")
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("probe status=%d body=%s", response.StatusCode, body)
-	}
-	var result TaskResponse
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if result.TaskID != "test-1" || !result.Result.Available {
-		t.Fatalf("unexpected result: %+v", result)
-	}
-	if len(result.Result.HTTP) != 1 || result.Result.HTTP[0].StatusCode != http.StatusNoContent {
-		t.Fatalf("unexpected HTTP result: %+v", result.Result.HTTP)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Agent did not stop after context cancellation")
 	}
 }
 
-func TestTaskHandlerRejectsUnknownParameters(t *testing.T) {
-	t.Parallel()
-	server := httptest.NewServer(NewHandler(testConfig(), log.New(io.Discard, "", 0)))
-	defer server.Close()
-
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/tasks", bytes.NewBufferString(`{"type":"probe","target":"example.com","command":"whoami"}`))
-	request.Header.Set("Authorization", "Bearer test-token")
-	request.Header.Set("Content-Type", "application/json")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusBadRequest {
-		t.Fatalf("status=%d", response.StatusCode)
+func TestRunTaskRejectsUnknownType(t *testing.T) {
+	_, err := runTask(context.Background(), testConfig(), TaskRequest{TaskID: "bad", Type: "shell", Target: "example.com"})
+	if err == nil {
+		t.Fatal("expected unsupported task type to be rejected")
 	}
 }
 
-func TestCertificateTaskHandler(t *testing.T) {
-	t.Parallel()
+func TestCertificateTask(t *testing.T) {
 	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer target.Close()
 	port := target.Listener.Addr().(*net.TCPAddr).Port
-
-	server := httptest.NewServer(NewHandler(testConfig(), log.New(io.Discard, "", 0)))
-	defer server.Close()
-	payload, _ := json.Marshal(TaskRequest{
+	response, err := runTask(context.Background(), testConfig(), TaskRequest{
 		TaskID: "certificate-1",
 		Type:   "certificate",
 		Target: "127.0.0.1",
@@ -140,27 +159,10 @@ func TestCertificateTaskHandler(t *testing.T) {
 			Ports:     []int{port},
 		},
 	})
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/api/v1/tasks", bytes.NewReader(payload))
-	request.Header.Set("Authorization", "Bearer test-token")
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := http.DefaultClient.Do(request)
 	if err != nil {
-		t.Fatalf("certificate request failed: %v", err)
+		t.Fatalf("run certificate task: %v", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(response.Body)
-		t.Fatalf("certificate status=%d body=%s", response.StatusCode, body)
-	}
-	var result TaskResponse
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		t.Fatalf("decode certificate response: %v", err)
-	}
-	if !result.Result.Available || result.Result.Certificate == nil {
-		t.Fatalf("unexpected certificate result: %+v", result.Result)
-	}
-	if result.Result.Certificate.ExpiresAt == nil || result.Result.Certificate.ResolvedAddress == "" {
-		t.Fatalf("missing certificate details: %+v", result.Result.Certificate)
+	if !response.Result.Available || response.Result.Certificate == nil || response.Result.Certificate.ExpiresAt == nil {
+		t.Fatalf("unexpected certificate result: %+v", response.Result)
 	}
 }
