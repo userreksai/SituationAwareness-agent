@@ -11,6 +11,10 @@ set -Eeuo pipefail
 # Optional secret files for unattended deployment:
 #   DOCKERHUB_TOKEN_FILE=/run/secrets/dockerhub_pull_token
 #   AGENT_SHARED_TOKEN_FILE=/run/secrets/agent_shared_token
+# Offline/private archive deployment:
+#   DOWNLOAD_URL=http://MASTER_IP:8891/situation-awareness-agent-1.1.0.tar
+#   DOWNLOAD_SHA256=<out-of-band trusted SHA-256; preferred>
+#   DOWNLOAD_SHA256_URL=${DOWNLOAD_URL}.sha256
 
 IMAGE_REF="${IMAGE_REF:-beiou/situationawareness-agent:1.1.0}"
 DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-beiou}"
@@ -27,9 +31,22 @@ AGENT_RECONNECT_MIN="${AGENT_RECONNECT_MIN:-1s}"
 AGENT_RECONNECT_MAX="${AGENT_RECONNECT_MAX:-30s}"
 AGENT_HEARTBEAT_INTERVAL="${AGENT_HEARTBEAT_INTERVAL:-20s}"
 WAIT_FOR_REGISTRATION="${WAIT_FOR_REGISTRATION:-false}"
+DOWNLOAD_URL="${DOWNLOAD_URL:-}"
+DOWNLOAD_SHA256="${DOWNLOAD_SHA256:-}"
+DOWNLOAD_SHA256_URL="${DOWNLOAD_SHA256_URL:-}"
+ALLOW_LEGACY_CONTAINER_MIGRATION="${ALLOW_LEGACY_CONTAINER_MIGRATION:-false}"
 CONTAINER_LABEL="com.situation-awareness.service=agent"
 docker_extra_args=()
 previous_available=false
+downloaded_image=""
+
+cleanup_download() {
+  if [[ -n "$downloaded_image" && -f "$downloaded_image" ]]; then
+    rm -f -- "$downloaded_image"
+  fi
+}
+
+trap cleanup_download EXIT
 
 restore_previous_on_error() {
   local exit_code="$?"
@@ -41,6 +58,7 @@ restore_previous_on_error() {
     docker container rename "$ROLLBACK_CONTAINER" "$CONTAINER_NAME" >/dev/null 2>&1
     docker container start "$CONTAINER_NAME" >/dev/null 2>&1
   fi
+  cleanup_download
   exit "$exit_code"
 }
 
@@ -99,6 +117,22 @@ docker info >/dev/null 2>&1 || fail "Docker daemon is not running or is not acce
 [[ "$MASTER_CONNECT_PATH" == /* ]] || fail "MASTER_CONNECT_PATH must start with /"
 [[ "$WAIT_FOR_REGISTRATION" == "true" || "$WAIT_FOR_REGISTRATION" == "false" ]] ||
   fail "WAIT_FOR_REGISTRATION must be true or false"
+[[ "$ALLOW_LEGACY_CONTAINER_MIGRATION" == "true" || "$ALLOW_LEGACY_CONTAINER_MIGRATION" == "false" ]] ||
+  fail "ALLOW_LEGACY_CONTAINER_MIGRATION must be true or false"
+if [[ -n "${HOST_PORT:-}" || -n "${BIND_ADDRESS:-}" ]]; then
+  fail "HOST_PORT and BIND_ADDRESS are obsolete; outbound-only Agent deployments publish no port"
+fi
+if [[ -n "$DOWNLOAD_URL" ]]; then
+  validate_no_whitespace "DOWNLOAD_URL" "$DOWNLOAD_URL"
+  if [[ -n "$DOWNLOAD_SHA256" ]]; then
+    validate_no_whitespace "DOWNLOAD_SHA256" "$DOWNLOAD_SHA256"
+    [[ "$DOWNLOAD_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] ||
+      fail "DOWNLOAD_SHA256 must be a SHA-256 value"
+  else
+    DOWNLOAD_SHA256_URL="${DOWNLOAD_SHA256_URL:-${DOWNLOAD_URL}.sha256}"
+    validate_no_whitespace "DOWNLOAD_SHA256_URL" "$DOWNLOAD_SHA256_URL"
+  fi
+fi
 
 existing_master_url="$(read_existing_value AGENT_MASTER_URL)"
 existing_agent_name="$(read_existing_value AGENT_NAME)"
@@ -117,20 +151,6 @@ validate_no_whitespace "AGENT_MASTER_URL" "$AGENT_MASTER_URL"
 [[ "$AGENT_MASTER_URL" == ws://* || "$AGENT_MASTER_URL" == wss://* ]] ||
   fail "AGENT_MASTER_URL must start with ws:// or wss://"
 
-DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:-}"
-if [[ -n "${DOCKERHUB_TOKEN_FILE:-}" ]]; then
-  DOCKERHUB_TOKEN="$(read_secret_file "$DOCKERHUB_TOKEN_FILE")"
-elif [[ -z "$DOCKERHUB_TOKEN" ]]; then
-  read -r -s -p "Docker Hub Read-only token for ${DOCKERHUB_USERNAME}: " DOCKERHUB_TOKEN
-  printf '\n'
-fi
-validate_no_whitespace "DOCKERHUB_TOKEN" "$DOCKERHUB_TOKEN"
-
-log "logging in to Docker Hub as ${DOCKERHUB_USERNAME}"
-printf '%s' "$DOCKERHUB_TOKEN" |
-  docker login --username "$DOCKERHUB_USERNAME" --password-stdin
-unset DOCKERHUB_TOKEN
-
 AGENT_SHARED_TOKEN="${AGENT_SHARED_TOKEN:-}"
 if [[ -n "${AGENT_SHARED_TOKEN_FILE:-}" ]]; then
   AGENT_SHARED_TOKEN="$(read_secret_file "$AGENT_SHARED_TOKEN_FILE")"
@@ -146,8 +166,50 @@ validate_no_whitespace "AGENT_SHARED_TOKEN" "$AGENT_SHARED_TOKEN"
 ((${#AGENT_SHARED_TOKEN} >= 32)) ||
   fail "AGENT_SHARED_TOKEN must contain at least 32 characters"
 
-log "pulling ${IMAGE_REF}"
-docker pull "$IMAGE_REF"
+if [[ -n "$DOWNLOAD_URL" ]]; then
+  require_command awk
+  require_command curl
+  require_command mktemp
+  require_command rm
+  require_command sha256sum
+  downloaded_image="$(mktemp "${TMPDIR:-/tmp}/situation-awareness-agent.XXXXXX.tar")"
+  log "downloading image archive from ${DOWNLOAD_URL}"
+  curl --fail --silent --show-error --location "$DOWNLOAD_URL" --output "$downloaded_image"
+  if [[ -n "$DOWNLOAD_SHA256" ]]; then
+    expected_checksum="$DOWNLOAD_SHA256"
+  else
+    expected_checksum="$(
+      curl --fail --silent --show-error --location "$DOWNLOAD_SHA256_URL" |
+        awk 'NR == 1 { print $1; exit }'
+    )"
+  fi
+  [[ "$expected_checksum" =~ ^[0-9a-fA-F]{64}$ ]] ||
+    fail "downloaded checksum is not a SHA-256 value"
+  actual_checksum="$(sha256sum "$downloaded_image" | awk '{ print $1 }')"
+  [[ "${actual_checksum,,}" == "${expected_checksum,,}" ]] ||
+    fail "image archive SHA-256 verification failed"
+  log "loading verified image archive"
+  docker load --input "$downloaded_image" >/dev/null
+  docker image inspect "$IMAGE_REF" >/dev/null 2>&1 ||
+    fail "archive did not contain expected image ${IMAGE_REF}"
+  cleanup_download
+  downloaded_image=""
+else
+  DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:-}"
+  if [[ -n "${DOCKERHUB_TOKEN_FILE:-}" ]]; then
+    DOCKERHUB_TOKEN="$(read_secret_file "$DOCKERHUB_TOKEN_FILE")"
+  elif [[ -z "$DOCKERHUB_TOKEN" ]]; then
+    read -r -s -p "Docker Hub Read-only token for ${DOCKERHUB_USERNAME}: " DOCKERHUB_TOKEN
+    printf '\n'
+  fi
+  validate_no_whitespace "DOCKERHUB_TOKEN" "$DOCKERHUB_TOKEN"
+  log "logging in to Docker Hub as ${DOCKERHUB_USERNAME}"
+  printf '%s' "$DOCKERHUB_TOKEN" |
+    docker login --username "$DOCKERHUB_USERNAME" --password-stdin
+  unset DOCKERHUB_TOKEN
+  log "pulling ${IMAGE_REF}"
+  docker pull "$IMAGE_REF"
+fi
 
 install -d -m 0700 "$CONFIG_DIR"
 container_tls_ca_file=""
@@ -186,7 +248,7 @@ if docker container inspect "$ROLLBACK_CONTAINER" >/dev/null 2>&1; then
       --format '{{ index .Config.Labels "com.situation-awareness.service" }}' \
       "$ROLLBACK_CONTAINER"
   )"
-  [[ "$rollback_label" == "agent" ]] ||
+  [[ "$rollback_label" == "agent" || "$ALLOW_LEGACY_CONTAINER_MIGRATION" == "true" ]] ||
     fail "container ${ROLLBACK_CONTAINER} exists but is not managed by this script"
   log "removing the previous rollback container"
   docker container rm --force "$ROLLBACK_CONTAINER" >/dev/null
@@ -198,8 +260,11 @@ if docker container inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
       --format '{{ index .Config.Labels "com.situation-awareness.service" }}' \
       "$CONTAINER_NAME"
   )"
-  [[ "$existing_label" == "agent" ]] ||
+  [[ "$existing_label" == "agent" || "$ALLOW_LEGACY_CONTAINER_MIGRATION" == "true" ]] ||
     fail "container ${CONTAINER_NAME} exists but is not managed by this script"
+  if [[ "$existing_label" != "agent" ]]; then
+    log "migrating legacy container ${CONTAINER_NAME}; it will be retained for rollback"
+  fi
   log "preserving existing container as ${ROLLBACK_CONTAINER}"
   docker container rename "$CONTAINER_NAME" "$ROLLBACK_CONTAINER"
   previous_available=true
@@ -261,4 +326,5 @@ if [[ "$previous_available" == "true" ]]; then
   printf '[deploy] Rollback: docker rm -f %s && docker rename %s %s && docker start %s\n' \
     "$CONTAINER_NAME" "$ROLLBACK_CONTAINER" "$CONTAINER_NAME" "$CONTAINER_NAME"
 fi
+cleanup_download
 trap - ERR

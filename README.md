@@ -51,6 +51,21 @@ sudo env \
   bash deploy/install-agent-docker.sh
 ```
 
+从 Master 临时下载服务加载经过 SHA-256 校验的镜像包，并迁移已有旧版无标签容器：
+
+```bash
+sudo env \
+  DOWNLOAD_URL=http://MASTER_IP:8891/situation-awareness-agent-1.1.0.tar \
+  DOWNLOAD_SHA256=从可信渠道取得的64位SHA256 \
+  MASTER_HOST=MASTER_IP \
+  AGENT_NAME=node-docker-01 \
+  ALLOW_LEGACY_CONTAINER_MIGRATION=true \
+  WAIT_FOR_REGISTRATION=true \
+  bash deploy/install-agent-docker.sh
+```
+
+优先通过可信的带外渠道传入 `DOWNLOAD_SHA256`；未传入时，下载目录必须提供同名的 `.sha256` 文件。旧版 `HOST_PORT` 和 `BIND_ADDRESS` 参数已禁用；新 Agent 不监听或映射任何宿主机端口。
+
 脚本会拉取 `beiou/situationawareness-agent:1.1.0`、创建只读容器、生成或复用节点 Token，并把配置保存到 `/etc/situation-awareness-agent/agent.env`。重复部署会复用已有 Token，避免节点管理凭据失效。
 
 如果原容器存在，脚本会保留为 `situation-awareness-agent-rollback`。新容器启动失败时自动恢复；成功后也保留旧容器，便于人工回滚。
