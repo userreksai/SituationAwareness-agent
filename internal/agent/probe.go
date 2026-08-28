@@ -56,6 +56,7 @@ type ProbeResult struct {
 	TCP              []TCPResult        `json:"tcp,omitempty"`
 	HTTP             []HTTPResult       `json:"http,omitempty"`
 	Certificate      *CertificateResult `json:"certificate,omitempty"`
+	Title            *TitleResult       `json:"title,omitempty"`
 }
 
 type DNSResult struct {
@@ -102,8 +103,10 @@ func runTask(parent context.Context, cfg Config, request TaskRequest) (TaskRespo
 		return runProbe(parent, cfg, request, spec, timeout), nil
 	case "certificate":
 		return runCertificate(parent, cfg, request, timeout)
+	case "title":
+		return runTitle(parent, cfg, request, timeout)
 	default:
-		return TaskResponse{}, fmt.Errorf("type must be probe or certificate")
+		return TaskResponse{}, fmt.Errorf("type must be probe, certificate, or title")
 	}
 }
 
@@ -164,8 +167,8 @@ func validateTask(cfg Config, request *TaskRequest) (time.Duration, error) {
 		return 0, fmt.Errorf("taskId must be at most 128 characters")
 	}
 	request.Type = strings.ToLower(strings.TrimSpace(request.Type))
-	if request.Type != "probe" && request.Type != "certificate" {
-		return 0, fmt.Errorf("type must be probe or certificate")
+	if request.Type != "probe" && request.Type != "certificate" && request.Type != "title" {
+		return 0, fmt.Errorf("type must be probe, certificate, or title")
 	}
 
 	timeout := cfg.DefaultTimeout

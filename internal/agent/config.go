@@ -9,23 +9,25 @@ import (
 )
 
 type Config struct {
-	ListenAddr     string
-	AgentName      string
-	SharedToken    string
-	MaxConcurrent  int
-	DefaultTimeout time.Duration
-	MaxTimeout     time.Duration
+	ListenAddr            string
+	AgentName             string
+	SharedToken           string
+	MaxConcurrent         int
+	DefaultTimeout        time.Duration
+	MaxTimeout            time.Duration
+	TitleMaxResponseBytes int64
 }
 
 func LoadConfig() (Config, error) {
 	hostname, _ := os.Hostname()
 	cfg := Config{
-		ListenAddr:     envOrDefault("AGENT_LISTEN_ADDR", ":8002"),
-		AgentName:      envOrDefault("AGENT_NAME", hostname),
-		SharedToken:    strings.TrimSpace(os.Getenv("AGENT_SHARED_TOKEN")),
-		MaxConcurrent:  8,
-		DefaultTimeout: 10 * time.Second,
-		MaxTimeout:     30 * time.Second,
+		ListenAddr:            envOrDefault("AGENT_LISTEN_ADDR", ":8002"),
+		AgentName:             envOrDefault("AGENT_NAME", hostname),
+		SharedToken:           strings.TrimSpace(os.Getenv("AGENT_SHARED_TOKEN")),
+		MaxConcurrent:         8,
+		DefaultTimeout:        10 * time.Second,
+		MaxTimeout:            30 * time.Second,
+		TitleMaxResponseBytes: 2 * 1024 * 1024,
 	}
 
 	var err error
@@ -38,6 +40,11 @@ func LoadConfig() (Config, error) {
 	if cfg.MaxTimeout, err = durationEnv("AGENT_MAX_TIMEOUT", cfg.MaxTimeout); err != nil {
 		return Config{}, err
 	}
+	if titleMaxBytes, sizeErr := positiveIntEnv("AGENT_TITLE_MAX_RESPONSE_BYTES", int(cfg.TitleMaxResponseBytes)); sizeErr != nil {
+		return Config{}, sizeErr
+	} else {
+		cfg.TitleMaxResponseBytes = int64(titleMaxBytes)
+	}
 	if strings.TrimSpace(cfg.ListenAddr) == "" {
 		return Config{}, fmt.Errorf("AGENT_LISTEN_ADDR cannot be empty")
 	}
@@ -46,6 +53,9 @@ func LoadConfig() (Config, error) {
 	}
 	if cfg.DefaultTimeout > cfg.MaxTimeout {
 		return Config{}, fmt.Errorf("AGENT_DEFAULT_TIMEOUT cannot exceed AGENT_MAX_TIMEOUT")
+	}
+	if cfg.TitleMaxResponseBytes > 10*1024*1024 {
+		return Config{}, fmt.Errorf("AGENT_TITLE_MAX_RESPONSE_BYTES cannot exceed 10485760")
 	}
 	return cfg, nil
 }
