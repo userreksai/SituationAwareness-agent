@@ -116,6 +116,27 @@ func TestFetchTitleContinuesAfterGenericServerTitle(t *testing.T) {
 	}
 }
 
+func TestFetchTitleUsesGenericServerTitleAsLastFallback(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>IIS Windows Server</title></head></html>`))
+	}))
+	defer target.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := fetchTitle(ctx, testConfig(), []string{target.URL})
+	if result.Error != "" {
+		t.Fatalf("fetch title failed: %s", result.Error)
+	}
+	if result.Title != "IIS Windows Server" || result.FinalURL != target.URL {
+		t.Fatalf("unexpected fallback result: %+v", result)
+	}
+	if len(result.Attempts) != 1 || result.Attempts[0].Outcome != "generic_title" {
+		t.Fatalf("attempts = %+v", result.Attempts)
+	}
+}
+
 func TestFetchTitleRetriesSoft404FinalURLWithBrowserProfile(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" {
