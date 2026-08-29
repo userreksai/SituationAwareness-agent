@@ -283,11 +283,12 @@ func parseTitleDocument(body []byte, contentType string) (titleDocument, error) 
 		case html.EndTagToken:
 			token := tokenizer.Token()
 			if inTitle && strings.EqualFold(token.Data, "title") {
-				document.title = normalizeTitle(value.String())
-				inTitle = false
-				if document.title == "" {
-					value.Reset()
+				parsedTitle := normalizeTitle(value.String())
+				if document.title == "" && parsedTitle != "" {
+					document.title = parsedTitle
 				}
+				inTitle = false
+				value.Reset()
 			}
 		}
 	}

@@ -42,6 +42,21 @@ func TestExtractTitleKeepsUTF8WithoutCharsetDeclaration(t *testing.T) {
 	}
 }
 
+func TestExtractTitleKeepsFirstValidTitleWhenAnotherDocumentIsAppended(t *testing.T) {
+	body := []byte(`<!doctype html>
+<html><head><title>火车时刻表|火车时刻表查询|火车票查询—-火车吧</title></head><body>首页</body></html>
+<!doctype html>
+<html><head><title>火车网404</title></head><body>404 页面</body></html>`)
+
+	title, err := extractTitle(body, "text/html; charset=utf-8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if title != "火车时刻表|火车时刻表查询|火车票查询—-火车吧" {
+		t.Fatalf("title = %q", title)
+	}
+}
+
 func TestExpandTitleCandidatesAddsWWWForRegistrableDomain(t *testing.T) {
 	candidates := []string{
 		"https://example.com/path?q=1",
