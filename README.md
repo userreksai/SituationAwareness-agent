@@ -82,7 +82,8 @@ curl -X POST http://127.0.0.1:8002/api/v1/tasks \
 - 请求体最大 64 KiB；端口最多 10 个；任务超时不能超过 `AGENT_MAX_TIMEOUT`。
 - 合法任务即使目标不可达也返回 HTTP 200，并通过 `result.available=false` 和各步骤的 `error` 描述探测结果。参数错误、未授权或节点繁忙分别返回 400、401、429。
 - `certificate` 任务默认读取目标的 443 端口，也可通过 `options.ports` 指定一个测试端口；结果位于 `result.certificate`，包含证书有效期、SAN、域名匹配状态、实际连接地址和错误信息。
-- `title` 任务接收域名或 HTTP(S) URL，裸域名依次尝试 HTTPS 和 HTTP；结果位于 `result.title`，包含标题、最终 URL、HTTP 状态、内容类型和检测时间。
+- `title` 任务接收域名或 HTTP(S) URL，依次尝试 HTTPS/HTTP 及适用的 `www` 候选。疑似软 404 标题会对最终 URL 使用浏览器 User-Agent 和禁缓存请求头复查；仍异常时继续下一个候选，全部失败则返回 `result.available=false`，不会把软 404 当成有效标题。
+- 标题结果位于 `result.title`，包含标题、最终 URL、HTTP 状态、内容类型、Server 响应头、检测时间和 `attempts` 诊断列表。每次尝试记录请求/最终 URL、User-Agent、状态码、标题、判定结果及失败原因；Agent 名称位于响应顶层的 `agent` 字段。
 
 ## 验证与构建
 

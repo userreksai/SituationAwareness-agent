@@ -42,6 +42,33 @@ func TestExtractTitleKeepsUTF8WithoutCharsetDeclaration(t *testing.T) {
 	}
 }
 
+func TestSoftErrorTitleReason(t *testing.T) {
+	tests := []struct {
+		title    string
+		wantSoft bool
+	}{
+		{title: "火车网404", wantSoft: true},
+		{title: "404 Not Found", wantSoft: true},
+		{title: "站点 - Page Not Found", wantSoft: true},
+		{title: "访问的页面不存在 - 示例网站", wantSoft: true},
+		{title: "找不到页面", wantSoft: true},
+		{title: "404公里骑行记录", wantSoft: false},
+		{title: "站点1404", wantSoft: false},
+		{title: "Not Found Records Archive", wantSoft: false},
+		{title: "如何解决页面不存在的问题", wantSoft: false},
+		{title: "Page Not Found Errors Explained", wantSoft: false},
+		{title: strings.Repeat("正常标题", 40) + "404", wantSoft: false},
+	}
+	for _, test := range tests {
+		t.Run(test.title, func(t *testing.T) {
+			got := softErrorTitleReason(test.title) != ""
+			if got != test.wantSoft {
+				t.Fatalf("soft error = %t, want %t; reason=%q", got, test.wantSoft, softErrorTitleReason(test.title))
+			}
+		})
+	}
+}
+
 func TestExpandTitleCandidatesAddsWWWForRegistrableDomain(t *testing.T) {
 	candidates := []string{
 		"https://example.com/path?q=1",
@@ -86,6 +113,92 @@ func TestFetchTitleContinuesAfterGenericServerTitle(t *testing.T) {
 	}
 	if !strings.HasPrefix(result.FinalURL, realSite.URL) {
 		t.Fatalf("final URL = %q", result.FinalURL)
+	}
+}
+
+func TestFetchTitleRetriesSoft404FinalURLWithBrowserProfile(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/home", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Server", "test-nginx")
+		if strings.HasPrefix(r.Header.Get("User-Agent"), "Mozilla/5.0") {
+			if r.Header.Get("Cache-Control") != "no-cache" || r.Header.Get("Pragma") != "no-cache" {
+				t.Errorf("browser retry missing cache bypass headers: %#v", r.Header)
+			}
+			_, _ = w.Write([]byte(`<html><head><title>火车时刻表|火车票查询—-火车吧</title></head></html>`))
+			return
+		}
+		_, _ = w.Write([]byte(`<html><head><title>火车网404</title></head></html>`))
+	}))
+	defer target.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := fetchTitle(ctx, testConfig(), []string{target.URL})
+	if result.Error != "" {
+		t.Fatalf("fetch title failed: %s", result.Error)
+	}
+	if result.Title != "火车时刻表|火车票查询—-火车吧" || result.FinalURL != target.URL+"/home" {
+		t.Fatalf("unexpected title result: %+v", result)
+	}
+	if result.Server != "test-nginx" {
+		t.Fatalf("server = %q", result.Server)
+	}
+	if len(result.Attempts) != 2 {
+		t.Fatalf("attempts = %+v", result.Attempts)
+	}
+	if result.Attempts[0].Outcome != "soft_404" || result.Attempts[0].FinalURL != target.URL+"/home" {
+		t.Fatalf("standard attempt = %+v", result.Attempts[0])
+	}
+	if result.Attempts[1].Outcome != "success" || !result.Attempts[1].BrowserRetry || result.Attempts[1].RequestedURL != target.URL+"/home" {
+		t.Fatalf("browser attempt = %+v", result.Attempts[1])
+	}
+}
+
+func TestFetchTitleContinuesAfterBrowserRetryStillReturnsSoft404(t *testing.T) {
+	soft404Site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>火车网404</title></head></html>`))
+	}))
+	defer soft404Site.Close()
+	realSite := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>正常业务标题</title></head></html>`))
+	}))
+	defer realSite.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := fetchTitle(ctx, testConfig(), []string{soft404Site.URL, realSite.URL})
+	if result.Error != "" || result.Title != "正常业务标题" {
+		t.Fatalf("unexpected title result: %+v", result)
+	}
+	if len(result.Attempts) != 3 || result.Attempts[0].Outcome != "soft_404" || !result.Attempts[1].BrowserRetry || result.Attempts[2].Outcome != "success" {
+		t.Fatalf("attempts = %+v", result.Attempts)
+	}
+}
+
+func TestFetchTitleReturnsFailureWhenAllAttemptsAreSoft404(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>火车网404</title></head></html>`))
+	}))
+	defer target.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := fetchTitle(ctx, testConfig(), []string{target.URL})
+	if result.Error == "" || !strings.Contains(result.Error, "soft 404") {
+		t.Fatalf("expected soft 404 failure, got %+v", result)
+	}
+	if result.Title != "" || len(result.Attempts) != 2 {
+		t.Fatalf("unexpected failure result: %+v", result)
+	}
+	if result.Attempts[0].Outcome != "soft_404" || result.Attempts[1].Outcome != "soft_404" || !result.Attempts[1].BrowserRetry {
+		t.Fatalf("attempts = %+v", result.Attempts)
 	}
 }
 
