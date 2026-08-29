@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 func TestExtractTitleDecodesGB2312HTTPMeta(t *testing.T) {
@@ -53,6 +56,48 @@ func TestExtractTitleKeepsFirstValidTitleWhenAnotherDocumentIsAppended(t *testin
 		t.Fatal(err)
 	}
 	if title != "火车时刻表|火车时刻表查询|火车票查询—-火车吧" {
+		t.Fatalf("title = %q", title)
+	}
+}
+
+func TestExtractTitleDecodesUndeclaredGB18030AndKeepsFirstValidTitle(t *testing.T) {
+	want := "258中文小说阅读网 - 提供最热门的小说阅读网"
+	firstTitle, err := simplifiedchinese.GB18030.NewEncoder().Bytes([]byte(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendedTitle, err := simplifiedchinese.GB18030.NewEncoder().Bytes([]byte("附加页面标题"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte(`<!doctype html><html><head><title>`), firstTitle...)
+	body = append(body, []byte(`</title></head><body>首页</body></html><html><head><title>`)...)
+	body = append(body, appendedTitle...)
+	body = append(body, []byte(`</title></head><body>附加页面</body></html>`)...)
+
+	title, err := extractTitle(body, "text/html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if title != want {
+		t.Fatalf("title = %q", title)
+	}
+}
+
+func TestExtractTitleKeepsDeclaredWindows1252(t *testing.T) {
+	want := "Café déjà vu - München"
+	encodedTitle, err := charmap.Windows1252.NewEncoder().Bytes([]byte(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := append([]byte(`<html><head><title>`), encodedTitle...)
+	body = append(body, []byte(`</title></head></html>`)...)
+
+	title, err := extractTitle(body, "text/html; charset=windows-1252")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if title != want {
 		t.Fatalf("title = %q", title)
 	}
 }

@@ -13,12 +13,15 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/charset"
 	"golang.org/x/net/publicsuffix"
 	"golang.org/x/text/encoding"
+	"golang.org/x/text/encoding/charmap"
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 const (
@@ -256,7 +259,7 @@ func parseTitleDocument(body []byte, contentType string) (titleDocument, error) 
 				return titleDocument{}, fmt.Errorf("parse HTML: %w", err)
 			}
 			if document.title == "" {
-				document.title = normalizeTitle(value.String())
+				document.title = normalizePageTitle(value.String())
 			}
 			return document, nil
 		case html.StartTagToken:
@@ -283,7 +286,7 @@ func parseTitleDocument(body []byte, contentType string) (titleDocument, error) 
 		case html.EndTagToken:
 			token := tokenizer.Token()
 			if inTitle && strings.EqualFold(token.Data, "title") {
-				parsedTitle := normalizeTitle(value.String())
+				parsedTitle := normalizePageTitle(value.String())
 				if document.title == "" && parsedTitle != "" {
 					document.title = parsedTitle
 				}
@@ -333,6 +336,46 @@ func findDeclaredHTMLEncoding(body []byte) (encoding.Encoding, bool) {
 
 func normalizeTitle(value string) string {
 	return strings.Join(strings.Fields(value), " ")
+}
+
+func normalizePageTitle(value string) string {
+	normalized := normalizeTitle(value)
+	if normalized == "" {
+		return ""
+	}
+
+	suspiciousLatin := 0
+	for _, character := range normalized {
+		if character > unicode.MaxASCII && character <= '\u00ff' {
+			suspiciousLatin++
+		}
+	}
+	if suspiciousLatin < 4 {
+		return normalized
+	}
+
+	originalBytes, err := charmap.Windows1252.NewEncoder().Bytes([]byte(normalized))
+	if err != nil {
+		return normalized
+	}
+	decoded, err := simplifiedchinese.GB18030.NewDecoder().Bytes(originalBytes)
+	if err != nil || !utf8.Valid(decoded) {
+		return normalized
+	}
+	candidate := normalizeTitle(string(decoded))
+	hanCharacters := 0
+	for _, character := range candidate {
+		if character == utf8.RuneError {
+			return normalized
+		}
+		if unicode.Is(unicode.Han, character) {
+			hanCharacters++
+		}
+	}
+	if hanCharacters < 4 {
+		return normalized
+	}
+	return candidate
 }
 
 func isGenericPageTitle(title string) bool {
