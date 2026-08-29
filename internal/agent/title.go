@@ -141,7 +141,6 @@ func fetchTitle(ctx context.Context, cfg Config, candidates []string) TitleResul
 	titleCandidates := expandTitleCandidates(candidates)
 	failures := make([]string, 0, len(titleCandidates)*2)
 	attempts := make([]TitleAttempt, 0, len(titleCandidates)*2)
-	var genericFallback *TitleResult
 	for _, candidate := range titleCandidates {
 		result, err := fetchTitleURLWithProfile(ctx, client, candidate, cfg.TitleMaxResponseBytes, checkedAt, monitoringTitleProfile)
 		if err != nil {
@@ -190,20 +189,12 @@ func fetchTitle(ctx context.Context, cfg Config, candidates []string) TitleResul
 			reason := "known server default title"
 			attempts = append(attempts, newTitleAttempt(candidate, result, monitoringTitleProfile, "generic_title", reason, nil))
 			failures = append(failures, rejectedTitleFailure(candidate, result, "generic title", reason))
-			if genericFallback == nil {
-				copy := result
-				genericFallback = &copy
-			}
 			continue
 		}
 
 		attempts = append(attempts, newTitleAttempt(candidate, result, monitoringTitleProfile, "success", "", nil))
 		result.Attempts = attempts
 		return result
-	}
-	if genericFallback != nil {
-		genericFallback.Attempts = attempts
-		return *genericFallback
 	}
 	message := strings.Join(failures, "; ")
 	if message == "" {
