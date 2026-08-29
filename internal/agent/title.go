@@ -13,7 +13,6 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"golang.org/x/net/html"
@@ -23,14 +22,10 @@ import (
 )
 
 const (
-	maxTitleRunes            = 4096
-	maxFrameDepth            = 2
-	maxFrameCandidates       = 8
-	maxCharsetScanBytes      = 64 * 1024
-	maxSoftErrorTitleRunes   = 128
-	maxDiagnosticTextRunes   = 512
-	monitoringTitleUserAgent = "SituationAwareness-Agent/1.0"
-	browserTitleUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	maxTitleRunes       = 4096
+	maxFrameDepth       = 2
+	maxFrameCandidates  = 8
+	maxCharsetScanBytes = 64 * 1024
 )
 
 var genericPageTitles = map[string]struct{}{
@@ -46,39 +41,13 @@ var genericPageTitles = map[string]struct{}{
 }
 
 type TitleResult struct {
-	Title       string         `json:"title,omitempty"`
-	FinalURL    string         `json:"finalUrl,omitempty"`
-	StatusCode  int            `json:"statusCode,omitempty"`
-	ContentType string         `json:"contentType,omitempty"`
-	Server      string         `json:"server,omitempty"`
-	CheckedAt   time.Time      `json:"checkedAt"`
-	Error       string         `json:"error,omitempty"`
-	Attempts    []TitleAttempt `json:"attempts,omitempty"`
+	Title       string    `json:"title,omitempty"`
+	FinalURL    string    `json:"finalUrl,omitempty"`
+	StatusCode  int       `json:"statusCode,omitempty"`
+	ContentType string    `json:"contentType,omitempty"`
+	CheckedAt   time.Time `json:"checkedAt"`
+	Error       string    `json:"error,omitempty"`
 }
-
-type TitleAttempt struct {
-	RequestedURL string `json:"requestedUrl"`
-	FinalURL     string `json:"finalUrl,omitempty"`
-	StatusCode   int    `json:"statusCode,omitempty"`
-	Title        string `json:"title,omitempty"`
-	ContentType  string `json:"contentType,omitempty"`
-	Server       string `json:"server,omitempty"`
-	UserAgent    string `json:"userAgent"`
-	BrowserRetry bool   `json:"browserRetry,omitempty"`
-	Outcome      string `json:"outcome"`
-	Reason       string `json:"reason,omitempty"`
-	Error        string `json:"error,omitempty"`
-}
-
-type titleRequestProfile struct {
-	userAgent    string
-	browserRetry bool
-}
-
-var (
-	monitoringTitleProfile = titleRequestProfile{userAgent: monitoringTitleUserAgent}
-	browserTitleProfile    = titleRequestProfile{userAgent: browserTitleUserAgent, browserRetry: true}
-)
 
 func runTitle(parent context.Context, cfg Config, request TaskRequest, timeout time.Duration) (TaskResponse, error) {
 	spec, err := normalizeTarget(request.Target, nil)
@@ -139,135 +108,89 @@ func fetchTitle(ctx context.Context, cfg Config, candidates []string) TitleResul
 	}
 
 	titleCandidates := expandTitleCandidates(candidates)
-	failures := make([]string, 0, len(titleCandidates)*2)
-	attempts := make([]TitleAttempt, 0, len(titleCandidates)*2)
+	failures := make([]string, 0, len(titleCandidates))
+	var genericFallback *TitleResult
 	for _, candidate := range titleCandidates {
-		result, err := fetchTitleURLWithProfile(ctx, client, candidate, cfg.TitleMaxResponseBytes, checkedAt, monitoringTitleProfile)
-		if err != nil {
-			attempts = append(attempts, newTitleAttempt(candidate, result, monitoringTitleProfile, "error", "", err))
-			failures = append(failures, truncateRunes(candidate+": "+err.Error(), maxDiagnosticTextRunes))
-			if ctx.Err() != nil {
-				break
+		result, err := fetchTitleURL(ctx, client, candidate, cfg.TitleMaxResponseBytes, checkedAt)
+		if err == nil {
+			if !isGenericPageTitle(result.Title) {
+				return result
+			}
+			if genericFallback == nil {
+				copy := result
+				genericFallback = &copy
 			}
 			continue
 		}
-
-		if reason := softErrorTitleReason(result.Title); reason != "" {
-			attempts = append(attempts, newTitleAttempt(candidate, result, monitoringTitleProfile, "soft_404", reason, nil))
-			failures = append(failures, rejectedTitleFailure(candidate, result, "soft 404", reason))
-
-			retryTarget := result.FinalURL
-			if retryTarget == "" {
-				retryTarget = candidate
-			}
-			browserResult, browserErr := fetchTitleURLWithProfile(ctx, client, retryTarget, cfg.TitleMaxResponseBytes, checkedAt, browserTitleProfile)
-			if browserErr != nil {
-				attempts = append(attempts, newTitleAttempt(retryTarget, browserResult, browserTitleProfile, "error", "", browserErr))
-				failures = append(failures, truncateRunes(retryTarget+" (browser retry): "+browserErr.Error(), maxDiagnosticTextRunes))
-				if ctx.Err() != nil {
-					break
-				}
-				continue
-			}
-			if browserReason := softErrorTitleReason(browserResult.Title); browserReason != "" {
-				attempts = append(attempts, newTitleAttempt(retryTarget, browserResult, browserTitleProfile, "soft_404", browserReason, nil))
-				failures = append(failures, rejectedTitleFailure(retryTarget+" (browser retry)", browserResult, "soft 404", browserReason))
-				continue
-			}
-			if isGenericPageTitle(browserResult.Title) {
-				reason := "known server default title"
-				attempts = append(attempts, newTitleAttempt(retryTarget, browserResult, browserTitleProfile, "generic_title", reason, nil))
-				failures = append(failures, rejectedTitleFailure(retryTarget+" (browser retry)", browserResult, "generic title", reason))
-				continue
-			}
-			attempts = append(attempts, newTitleAttempt(retryTarget, browserResult, browserTitleProfile, "success", "", nil))
-			browserResult.Attempts = attempts
-			return browserResult
+		failures = append(failures, candidate+": "+err.Error())
+		if ctx.Err() != nil {
+			break
 		}
-
-		if isGenericPageTitle(result.Title) {
-			reason := "known server default title"
-			attempts = append(attempts, newTitleAttempt(candidate, result, monitoringTitleProfile, "generic_title", reason, nil))
-			failures = append(failures, rejectedTitleFailure(candidate, result, "generic title", reason))
-			continue
-		}
-
-		attempts = append(attempts, newTitleAttempt(candidate, result, monitoringTitleProfile, "success", "", nil))
-		result.Attempts = attempts
-		return result
+	}
+	if genericFallback != nil {
+		return *genericFallback
 	}
 	message := strings.Join(failures, "; ")
 	if message == "" {
 		message = "title request failed"
 	}
-	return TitleResult{CheckedAt: checkedAt, Error: message, Attempts: attempts}
+	return TitleResult{CheckedAt: checkedAt, Error: message}
 }
 
 func fetchTitleURL(ctx context.Context, client *http.Client, target string, maxResponseBytes int64, checkedAt time.Time) (TitleResult, error) {
-	return fetchTitleURLWithProfile(ctx, client, target, maxResponseBytes, checkedAt, monitoringTitleProfile)
+	return fetchTitleURLDepth(ctx, client, target, maxResponseBytes, checkedAt, make(map[string]struct{}), 0)
 }
 
-func fetchTitleURLWithProfile(ctx context.Context, client *http.Client, target string, maxResponseBytes int64, checkedAt time.Time, profile titleRequestProfile) (TitleResult, error) {
-	return fetchTitleURLDepth(ctx, client, target, maxResponseBytes, checkedAt, make(map[string]struct{}), 0, profile)
-}
-
-func fetchTitleURLDepth(ctx context.Context, client *http.Client, target string, maxResponseBytes int64, checkedAt time.Time, visited map[string]struct{}, depth int, profile titleRequestProfile) (TitleResult, error) {
+func fetchTitleURLDepth(ctx context.Context, client *http.Client, target string, maxResponseBytes int64, checkedAt time.Time, visited map[string]struct{}, depth int) (TitleResult, error) {
 	if _, ok := visited[target]; ok {
-		return TitleResult{FinalURL: target, CheckedAt: checkedAt}, errors.New("frame URL loop detected")
+		return TitleResult{}, errors.New("frame URL loop detected")
 	}
 	visited[target] = struct{}{}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
-		return TitleResult{FinalURL: target, CheckedAt: checkedAt}, err
+		return TitleResult{}, err
 	}
-	request.Header.Set("User-Agent", profile.userAgent)
+	request.Header.Set("User-Agent", "SituationAwareness-Agent/1.0")
 	request.Header.Set("Accept", "text/html,application/xhtml+xml")
 	request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.6")
-	if profile.browserRetry {
-		request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-		request.Header.Set("Cache-Control", "no-cache")
-		request.Header.Set("Pragma", "no-cache")
-		request.Header.Set("Upgrade-Insecure-Requests", "1")
-	}
 
 	response, err := client.Do(request)
 	if err != nil {
-		return TitleResult{FinalURL: target, CheckedAt: checkedAt}, err
+		return TitleResult{}, err
 	}
 	defer response.Body.Close()
-	finalURL := target
-	if response.Request != nil && response.Request.URL != nil {
-		finalURL = response.Request.URL.String()
-	}
-	result := TitleResult{
-		FinalURL:    finalURL,
-		StatusCode:  response.StatusCode,
-		ContentType: truncateRunes(response.Header.Get("Content-Type"), maxDiagnosticTextRunes),
-		Server:      truncateRunes(strings.TrimSpace(response.Header.Get("Server")), maxDiagnosticTextRunes),
-		CheckedAt:   checkedAt,
-	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return result, fmt.Errorf("target returned HTTP %d", response.StatusCode)
+		return TitleResult{}, fmt.Errorf("target returned HTTP %d", response.StatusCode)
 	}
 
 	limited := io.LimitReader(response.Body, maxResponseBytes+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
-		return result, fmt.Errorf("read response: %w", err)
+		return TitleResult{}, fmt.Errorf("read response: %w", err)
 	}
 	if int64(len(body)) > maxResponseBytes {
-		return result, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
+		return TitleResult{}, fmt.Errorf("response exceeds %d bytes", maxResponseBytes)
 	}
 	document, err := parseTitleDocument(body, response.Header.Get("Content-Type"))
 	if err != nil {
-		return result, err
+		return TitleResult{}, err
 	}
 	if utf8.RuneCountInString(document.title) > maxTitleRunes {
-		return result, fmt.Errorf("title exceeds %d characters", maxTitleRunes)
+		return TitleResult{}, fmt.Errorf("title exceeds %d characters", maxTitleRunes)
 	}
-	result.Title = document.title
+	finalURL := target
+	if response.Request != nil && response.Request.URL != nil {
+		finalURL = response.Request.URL.String()
+	}
+	result := TitleResult{
+		Title:       document.title,
+		FinalURL:    finalURL,
+		StatusCode:  response.StatusCode,
+		ContentType: response.Header.Get("Content-Type"),
+		CheckedAt:   checkedAt,
+	}
 
 	if depth < maxFrameDepth && (result.Title == "" || isGenericPageTitle(result.Title)) {
 		frameFailures := make([]string, 0, len(document.frameSources))
@@ -277,7 +200,7 @@ func fetchTitleURLDepth(ctx context.Context, client *http.Client, target string,
 				frameFailures = append(frameFailures, source+": "+resolveErr.Error())
 				continue
 			}
-			frameResult, frameErr := fetchTitleURLDepth(ctx, client, frameURL, maxResponseBytes, checkedAt, visited, depth+1, profile)
+			frameResult, frameErr := fetchTitleURLDepth(ctx, client, frameURL, maxResponseBytes, checkedAt, visited, depth+1)
 			if frameErr != nil {
 				frameFailures = append(frameFailures, frameURL+": "+frameErr.Error())
 				continue
@@ -287,11 +210,11 @@ func fetchTitleURLDepth(ctx context.Context, client *http.Client, target string,
 			}
 		}
 		if result.Title == "" && len(frameFailures) > 0 {
-			return result, fmt.Errorf("page title is empty; frame lookup failed: %s", strings.Join(frameFailures, "; "))
+			return TitleResult{}, fmt.Errorf("page title is empty; frame lookup failed: %s", strings.Join(frameFailures, "; "))
 		}
 	}
 	if result.Title == "" {
-		return result, errors.New("page has no valid title element")
+		return TitleResult{}, errors.New("page has no valid title element")
 	}
 	return result, nil
 }
@@ -415,99 +338,6 @@ func isGenericPageTitle(title string) bool {
 	normalized := strings.ToLower(normalizeTitle(title))
 	_, ok := genericPageTitles[normalized]
 	return ok
-}
-
-func softErrorTitleReason(title string) string {
-	normalized := strings.ToLower(normalizeTitle(title))
-	if normalized == "" || utf8.RuneCountInString(normalized) > maxSoftErrorTitleRunes {
-		return ""
-	}
-	trimmed := strings.Trim(normalized, " \t\r\n-_|:：—–·()[]【】")
-	runes := []rune(trimmed)
-	if len(runes) >= 3 && runes[len(runes)-3] == '4' && runes[len(runes)-2] == '0' && runes[len(runes)-1] == '4' {
-		if len(runes) == 3 || !unicode.IsDigit(runes[len(runes)-4]) {
-			return "title is or ends with 404"
-		}
-	}
-
-	for _, phrase := range []string{
-		"访问的页面不存在",
-		"页面不存在",
-		"找不到页面",
-		"网页不存在",
-		"页面未找到",
-	} {
-		if hasStandaloneTitleMarker(normalized, phrase) {
-			return "title indicates " + phrase
-		}
-	}
-	if strings.Contains(normalized, "404 not found") {
-		return "title contains 404 not found"
-	}
-	for _, phrase := range []string{"page not found", "not found"} {
-		if hasStandaloneTitleMarker(normalized, phrase) {
-			return "title indicates " + phrase
-		}
-	}
-	return ""
-}
-
-func hasStandaloneTitleMarker(title, marker string) bool {
-	if title == marker {
-		return true
-	}
-	for _, separator := range []string{" - ", "-", " | ", "|", " — ", "—", " – ", "–", "_", ":", "："} {
-		if strings.HasPrefix(title, marker+separator) || strings.HasSuffix(title, separator+marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func newTitleAttempt(requestedURL string, result TitleResult, profile titleRequestProfile, outcome, reason string, err error) TitleAttempt {
-	finalURL := result.FinalURL
-	if finalURL == "" {
-		finalURL = requestedURL
-	}
-	attempt := TitleAttempt{
-		RequestedURL: truncateRunes(requestedURL, maxDiagnosticTextRunes),
-		FinalURL:     truncateRunes(finalURL, maxDiagnosticTextRunes),
-		StatusCode:   result.StatusCode,
-		Title:        truncateRunes(result.Title, maxDiagnosticTextRunes),
-		ContentType:  truncateRunes(result.ContentType, maxDiagnosticTextRunes),
-		Server:       truncateRunes(result.Server, maxDiagnosticTextRunes),
-		UserAgent:    profile.userAgent,
-		BrowserRetry: profile.browserRetry,
-		Outcome:      outcome,
-		Reason:       truncateRunes(reason, maxDiagnosticTextRunes),
-	}
-	if err != nil {
-		attempt.Error = truncateRunes(err.Error(), maxDiagnosticTextRunes)
-	}
-	return attempt
-}
-
-func rejectedTitleFailure(requestedURL string, result TitleResult, category, reason string) string {
-	finalURL := result.FinalURL
-	if finalURL == "" {
-		finalURL = requestedURL
-	}
-	return fmt.Sprintf(
-		"%s: %s %q (%s; final URL %s)",
-		truncateRunes(requestedURL, maxDiagnosticTextRunes),
-		category,
-		truncateRunes(result.Title, maxDiagnosticTextRunes),
-		reason,
-		truncateRunes(finalURL, maxDiagnosticTextRunes),
-	)
-}
-
-func truncateRunes(value string, maximum int) string {
-	runes := []rune(value)
-	if len(runes) <= maximum {
-		return value
-	}
-	return string(runes[:maximum]) + "…"
 }
 
 func expandTitleCandidates(candidates []string) []string {
