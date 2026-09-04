@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	maxTitleRunes       = 4096
-	maxFrameDepth       = 2
-	maxFrameCandidates  = 8
-	maxCharsetScanBytes = 64 * 1024
+	maxTitleRunes         = 4096
+	maxFrameDepth         = 2
+	maxFrameCandidates    = 8
+	maxCharsetScanBytes   = 64 * 1024
+	titleCandidateTimeout = 15 * time.Second
 )
 
 var genericPageTitles = map[string]struct{}{
@@ -84,10 +85,17 @@ func runTitle(parent context.Context, cfg Config, request TaskRequest, timeout t
 }
 
 func fetchTitle(ctx context.Context, cfg Config, candidates []string) TitleResult {
+	return fetchTitleWithCandidateTimeout(ctx, cfg, candidates, titleCandidateTimeout)
+}
+
+func fetchTitleWithCandidateTimeout(ctx context.Context, cfg Config, candidates []string, candidateTimeout time.Duration) TitleResult {
 	checkedAt := time.Now().UTC()
+	if candidateTimeout <= 0 {
+		candidateTimeout = titleCandidateTimeout
+	}
 	transport := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
-		DialContext:         (&net.Dialer{}).DialContext,
+		DialContext:         (&net.Dialer{Timeout: candidateTimeout}).DialContext,
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        2,
 		IdleConnTimeout:     10 * time.Second,
@@ -114,7 +122,12 @@ func fetchTitle(ctx context.Context, cfg Config, candidates []string) TitleResul
 	failures := make([]string, 0, len(titleCandidates))
 	var genericFallback *TitleResult
 	for _, candidate := range titleCandidates {
-		result, err := fetchTitleURL(ctx, client, candidate, cfg.TitleMaxResponseBytes, checkedAt)
+		if ctx.Err() != nil {
+			break
+		}
+		candidateCtx, cancelCandidate := context.WithTimeout(ctx, candidateTimeout)
+		result, err := fetchTitleURL(candidateCtx, client, candidate, cfg.TitleMaxResponseBytes, checkedAt)
+		cancelCandidate()
 		if err == nil {
 			if !isGenericPageTitle(result.Title) {
 				return result

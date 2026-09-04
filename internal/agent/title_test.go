@@ -149,6 +149,36 @@ func TestFetchTitleContinuesAfterGenericServerTitle(t *testing.T) {
 	}
 }
 
+func TestFetchTitleContinuesAfterCandidateTimeout(t *testing.T) {
+	timedOut := make(chan struct{}, 1)
+	slowSite := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+		timedOut <- struct{}{}
+	}))
+	defer slowSite.Close()
+
+	realSite := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<html><head><title>HTTP 回退标题</title></head></html>`))
+	}))
+	defer realSite.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result := fetchTitleWithCandidateTimeout(ctx, testConfig(), []string{slowSite.URL, realSite.URL}, 50*time.Millisecond)
+	if result.Error != "" {
+		t.Fatalf("fetch title failed: %s", result.Error)
+	}
+	if result.Title != "HTTP 回退标题" || !strings.HasPrefix(result.FinalURL, realSite.URL) {
+		t.Fatalf("unexpected title result: %+v", result)
+	}
+	select {
+	case <-timedOut:
+	default:
+		t.Fatal("first candidate was not canceled after its independent timeout")
+	}
+}
+
 func TestFetchTitleFollowsSameSiteFrameWhenPageTitleIsEmpty(t *testing.T) {
 	var target *httptest.Server
 	target = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

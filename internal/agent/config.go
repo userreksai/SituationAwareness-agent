@@ -26,7 +26,7 @@ func LoadConfig() (Config, error) {
 		SharedToken:           strings.TrimSpace(os.Getenv("AGENT_SHARED_TOKEN")),
 		MaxConcurrent:         8,
 		DefaultTimeout:        10 * time.Second,
-		MaxTimeout:            30 * time.Second,
+		MaxTimeout:            60 * time.Second,
 		TitleMaxResponseBytes: 2 * 1024 * 1024,
 	}
 
