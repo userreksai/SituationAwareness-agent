@@ -83,6 +83,7 @@ curl -X POST http://127.0.0.1:8002/api/v1/tasks \
 - 合法任务即使目标不可达也返回 HTTP 200，并通过 `result.available=false` 和各步骤的 `error` 描述探测结果。参数错误、未授权或节点繁忙分别返回 400、401、429。
 - `certificate` 任务默认读取目标的 443 端口，也可通过 `options.ports` 指定一个测试端口；结果位于 `result.certificate`，包含证书有效期、SAN、域名匹配状态、实际连接地址和错误信息。
 - `title` 任务接收域名或 HTTP(S) URL，裸域名保持 HTTPS、HTTPS WWW、HTTP、HTTP WWW 的顺序尝试；每个候选地址独立限制为 15 秒，并同时受任务总超时限制。结果位于 `result.title`，包含标题、最终 URL、HTTP 状态、内容类型和检测时间。
+- 标题请求默认使用 `SituationAwareness-Agent/1.0`。仅收到 HTTP 403 时，以 `curl/8.5.0` 为 User-Agent 对同一请求重试一次，其他请求头保持不变，无需安装 curl。重试与首次请求共用当前候选的 15 秒预算，不额外延长 Master 下发的总超时（建议 `TITLE_AGENT_TIMEOUT=60s`）。重试成功后沿用原有标题解析；仍失败则继续下一个候选，失败信息会注明兼容重试的结果。HTTP 403 正文本身不会作为有效标题返回。
 
 ## 验证与构建
 

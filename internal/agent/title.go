@@ -25,11 +25,12 @@ import (
 )
 
 const (
-	maxTitleRunes         = 4096
-	maxFrameDepth         = 2
-	maxFrameCandidates    = 8
-	maxCharsetScanBytes   = 64 * 1024
-	titleCandidateTimeout = 15 * time.Second
+	maxTitleRunes          = 4096
+	maxFrameDepth          = 2
+	maxFrameCandidates     = 8
+	maxCharsetScanBytes    = 64 * 1024
+	titleCandidateTimeout  = 15 * time.Second
+	titleFallbackUserAgent = "curl/8.5.0"
 )
 
 var genericPageTitles = map[string]struct{}{
@@ -175,9 +176,25 @@ func fetchTitleURLDepth(ctx context.Context, client *http.Client, target string,
 	if err != nil {
 		return TitleResult{}, err
 	}
+	retriedForbidden := false
+	if response.StatusCode == http.StatusForbidden && ctx.Err() == nil {
+		// Close without draining an error page so its body cannot consume the
+		// time left for the retry. Both requests share the candidate deadline.
+		response.Body.Close()
+		retryRequest := request.Clone(ctx)
+		retryRequest.Header.Set("User-Agent", titleFallbackUserAgent)
+		response, err = client.Do(retryRequest)
+		if err != nil {
+			return TitleResult{}, fmt.Errorf("target returned HTTP 403; retry with User-Agent %q failed: %w", titleFallbackUserAgent, err)
+		}
+		retriedForbidden = true
+	}
 	defer response.Body.Close()
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
+		if retriedForbidden {
+			return TitleResult{}, fmt.Errorf("target returned HTTP 403; retry with User-Agent %q returned HTTP %d", titleFallbackUserAgent, response.StatusCode)
+		}
 		return TitleResult{}, fmt.Errorf("target returned HTTP %d", response.StatusCode)
 	}
 
