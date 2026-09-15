@@ -16,13 +16,14 @@ type handler struct {
 	cfg       Config
 	logger    *log.Logger
 	semaphore chan struct{}
+	seo       *seoFetcher
 }
 
 func NewHandler(cfg Config, logger *log.Logger) http.Handler {
 	if logger == nil {
 		logger = log.Default()
 	}
-	service := &handler{cfg: cfg, logger: logger, semaphore: make(chan struct{}, cfg.MaxConcurrent)}
+	service := &handler{cfg: cfg, logger: logger, semaphore: make(chan struct{}, cfg.MaxConcurrent), seo: newSEOFetcher()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", service.health)
 	mux.HandleFunc("GET /api/v1/health", service.health)
@@ -36,6 +37,7 @@ func (h *handler) health(w http.ResponseWriter, _ *http.Request) {
 		"service":       "situation-awareness-agent",
 		"agentName":     h.cfg.AgentName,
 		"authenticated": h.cfg.SharedToken != "",
+		"taskTypes":     []string{"probe", "certificate", "title", "seo"},
 		"time":          time.Now().UTC(),
 	})
 }
@@ -66,12 +68,16 @@ func (h *handler) tasks(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	response, err := runTask(request.Context(), h.cfg, task)
+	response, err := runTask(request.Context(), h.cfg, task, h.seo)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "invalid_task", err.Error())
 		return
 	}
 	h.logger.Printf("task=%s target=%q available=%t duration_ms=%d", response.TaskID, response.Target, response.Result.Available, response.DurationMS)
+	if response.Result.SEO != nil {
+		r := response.Result.SEO
+		h.logger.Printf("seo task=%s domain=%q upstream_status=%d bytes=%d error=%q retry_at=%v", response.TaskID, response.Target, r.StatusCode, len(r.Body), r.Error, r.RetryAt)
+	}
 	writeJSON(w, http.StatusOK, response)
 }
 
