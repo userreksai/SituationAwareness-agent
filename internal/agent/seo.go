@@ -23,13 +23,14 @@ const seoUserAgent = "seo-monitor/1.0 (daily metrics collector; contact your adm
 // SEO accepts a hostname, never an arbitrary URL. The only network destination
 // is the fixed Aizhan HTTPS origin; redirects are not followed.
 type SEOResult struct {
-	URL         string     `json:"url"`
-	StatusCode  int        `json:"statusCode"`
-	ContentType string     `json:"contentType"`
-	Body        []byte     `json:"body,omitempty"` // JSON base64 preserves original response bytes.
-	CheckedAt   time.Time  `json:"checkedAt"`
-	RetryAt     *time.Time `json:"retryAt,omitempty"`
-	Error       string     `json:"error,omitempty"`
+	SourceBlocked bool       `json:"sourceBlocked,omitempty"`
+	URL           string     `json:"url"`
+	StatusCode    int        `json:"statusCode"`
+	ContentType   string     `json:"contentType"`
+	Body          []byte     `json:"body,omitempty"` // JSON base64 preserves original response bytes.
+	CheckedAt     time.Time  `json:"checkedAt"`
+	RetryAt       *time.Time `json:"retryAt,omitempty"`
+	Error         string     `json:"error,omitempty"`
 }
 
 type seoFetcher struct {
@@ -38,6 +39,7 @@ type seoFetcher struct {
 	mu       sync.Mutex
 	next     time.Time
 	failures int
+	blocked  bool
 }
 
 func newSEOFetcher() *seoFetcher {
@@ -97,8 +99,10 @@ func (f *seoFetcher) fetch(ctx context.Context, target string) SEOResult {
 	}
 	f.mu.Lock()
 	until := f.next
+	blocked := f.blocked
 	f.mu.Unlock()
 	if until.After(time.Now()) {
+		result.SourceBlocked = blocked
 		result.RetryAt = &until
 		result.Error = "seo source is cooling down or rate limited"
 		return result
@@ -135,6 +139,16 @@ func (f *seoFetcher) fetch(ctx context.Context, target string) SEOResult {
 	if err != nil {
 		result.Body = nil
 		result.Error = err.Error()
+		result.SourceBlocked = result.StatusCode == 403 || result.StatusCode == 429 ||
+			(result.RetryAt != nil && result.RetryAt.After(time.Now()))
+		if !result.SourceBlocked {
+			// Transport errors, empty pages and ordinary 5xx responses affect
+			// only this task. Keep the normal gap for the next domain.
+			f.next = time.Now().UTC().Add(10 * time.Second)
+			f.blocked = false
+			return result
+		}
+		f.blocked = true
 		f.failures++
 		delay := 15 * time.Minute
 		for n := 1; n < f.failures && delay < time.Hour; n++ {
@@ -151,6 +165,7 @@ func (f *seoFetcher) fetch(ctx context.Context, target string) SEOResult {
 		result.RetryAt = &until
 	} else {
 		f.failures = 0
+		f.blocked = false
 		f.next = time.Now().UTC().Add(10 * time.Second)
 	}
 	return result

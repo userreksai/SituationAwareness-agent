@@ -120,3 +120,48 @@ func TestSEOAPIAuthenticationAndResponseContract(t *testing.T) {
 		t.Fatal("unauthenticated deployment accepted seo task")
 	}
 }
+
+func TestSEOTransientErrorsDoNotCoolWholeSource(t *testing.T) {
+	for _, kind := range []string{"timeout", "empty", "503"} {
+		t.Run(kind, func(t *testing.T) {
+			f := newSEOFetcher()
+			f.client.Transport = seoTransport(func(r *http.Request) (*http.Response, error) {
+				if kind == "timeout" {
+					return nil, context.DeadlineExceeded
+				}
+				status := 200
+				if kind == "503" {
+					status = 503
+				}
+				return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+			})
+			r := f.fetch(context.Background(), "https://www.aizhan.com/cha/first.com/")
+			if r.Error == "" || r.SourceBlocked || f.blocked || f.failures != 0 || time.Until(f.next) > 11*time.Second {
+				t.Fatalf("ordinary error opened circuit: %+v", r)
+			}
+			// Advance only the ordinary request gap; the next domain can succeed.
+			f.next = time.Now().Add(-time.Second)
+			f.client.Transport = seoTransport(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("result"))}, nil
+			})
+			if r = f.fetch(context.Background(), "https://www.aizhan.com/cha/next.com/"); r.Error != "" {
+				t.Fatal(r.Error)
+			}
+		})
+	}
+}
+
+func TestSEOExplicitBlockSurvivesNextTask(t *testing.T) {
+	f := newSEOFetcher()
+	f.client.Transport = seoTransport(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 429, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	r := f.fetch(context.Background(), "https://www.aizhan.com/cha/first.com/")
+	if !r.SourceBlocked || r.RetryAt == nil || time.Until(*r.RetryAt) < 14*time.Minute {
+		t.Fatalf("missing source block: %+v", r)
+	}
+	r = f.fetch(context.Background(), "https://www.aizhan.com/cha/next.com/")
+	if !r.SourceBlocked || r.StatusCode != 0 || r.RetryAt == nil {
+		t.Fatalf("cooldown gate lost blocking reason: %+v", r)
+	}
+}
