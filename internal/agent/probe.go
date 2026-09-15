@@ -57,6 +57,7 @@ type ProbeResult struct {
 	HTTP             []HTTPResult       `json:"http,omitempty"`
 	Certificate      *CertificateResult `json:"certificate,omitempty"`
 	Title            *TitleResult       `json:"title,omitempty"`
+	SEO              *SEOResult         `json:"seo,omitempty"`
 }
 
 type DNSResult struct {
@@ -88,7 +89,7 @@ type targetSpec struct {
 	httpCandidates []string
 }
 
-func runTask(parent context.Context, cfg Config, request TaskRequest) (TaskResponse, error) {
+func runTask(parent context.Context, cfg Config, request TaskRequest, seo ...*seoFetcher) (TaskResponse, error) {
 	timeout, err := validateTask(cfg, &request)
 	if err != nil {
 		return TaskResponse{}, err
@@ -105,8 +106,16 @@ func runTask(parent context.Context, cfg Config, request TaskRequest) (TaskRespo
 		return runCertificate(parent, cfg, request, timeout)
 	case "title":
 		return runTitle(parent, cfg, request, timeout)
+	case "seo":
+		if cfg.SharedToken == "" {
+			return TaskResponse{}, fmt.Errorf("seo tasks require AGENT_SHARED_TOKEN")
+		}
+		if len(seo) != 1 || seo[0] == nil {
+			return TaskResponse{}, fmt.Errorf("seo collector unavailable")
+		}
+		return seo[0].run(parent, cfg, request, timeout)
 	default:
-		return TaskResponse{}, fmt.Errorf("type must be probe, certificate, or title")
+		return TaskResponse{}, fmt.Errorf("type must be probe, certificate, title, or seo")
 	}
 }
 
@@ -167,8 +176,8 @@ func validateTask(cfg Config, request *TaskRequest) (time.Duration, error) {
 		return 0, fmt.Errorf("taskId must be at most 128 characters")
 	}
 	request.Type = strings.ToLower(strings.TrimSpace(request.Type))
-	if request.Type != "probe" && request.Type != "certificate" && request.Type != "title" {
-		return 0, fmt.Errorf("type must be probe, certificate, or title")
+	if request.Type != "probe" && request.Type != "certificate" && request.Type != "title" && request.Type != "seo" {
+		return 0, fmt.Errorf("type must be probe, certificate, title, or seo")
 	}
 
 	timeout := cfg.DefaultTimeout
