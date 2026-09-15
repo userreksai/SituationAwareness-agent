@@ -71,9 +71,9 @@ curl -X POST http://127.0.0.1:8002/api/v1/tasks \
 
 使用原有 `POST /api/v1/tasks` 和 Bearer Token。必须设置 `AGENT_SHARED_TOKEN`；`target` 只接受域名。唯一上游为 `https://www.aizhan.com/cha/{domain}/`，不跟随重定向、不接受任意 URL 或端口，不执行 shell 命令。
 
-结果位于 `result.seo`：`url`、`statusCode`、`contentType`、`body`（原始 HTML 的 base64）、`checkedAt`、`error`、可选 `retryAt`。`result.available=false` 时不可当作有效页面，HTTP 200 空正文也会失败。主控必须继续校验页面域名和关键权重；Agent 不解析权重、不写数据库。
+结果位于 `result.seo`：`url`、`statusCode`、`contentType`、`body`（原始 HTML 的 base64）、`checkedAt`、`error`、可选 `retryAt` 和 `sourceBlocked`。`result.available=false` 时不可当作有效页面，HTTP 200 空正文也会失败。主控必须继续校验页面域名和关键权重；Agent 不解析权重、不写数据库。
 
-每进程仅一个 SEO 请求，请求完成后至少间隔 10 秒；失败冷却 15 分钟，连续失败翻倍至最多 1 小时，遵守更长的 `Retry-After`。正文最多 3 MiB。调用过频或忙时返回不可用结果及 `retryAt`，不能通过多主控/并发请求绕过限制。SEO 任务同样受 `AGENT_MAX_CONCURRENT` 和 `AGENT_MAX_TIMEOUT` 限制。
+每进程仅一个 SEO 请求，请求完成后至少间隔 10 秒。普通超时、空正文和普通 5xx 只令本任务失败，保留正常 10 秒间隔供后续域名执行；源站 403/429 或失败响应带有效 `Retry-After` 才设置 `sourceBlocked=true`，冷却 15 分钟，连续封禁翻倍至最多 1 小时，遵守更长的 `Retry-After`。正文最多 3 MiB。调用过频或忙时返回不可用结果及 `retryAt`，但不标记为源站封禁。SEO 任务同样受 `AGENT_MAX_CONCURRENT` 和 `AGENT_MAX_TIMEOUT` 限制；主控应区分 Agent 容量不足返回的 HTTP 429 与 `result.seo.statusCode=429`。
 
 健康检查的 `taskTypes` 包含 `seo` 表示支持新版任务。源码部署沿用 `go build` 和已有 systemd 安装路径；Docker 部署需要重新构建/发布并更新镜像，Git 合并本身不会替换已运行容器，也不会自动更新 Docker Hub 镜像。
 

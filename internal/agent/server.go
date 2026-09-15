@@ -76,7 +76,7 @@ func (h *handler) tasks(w http.ResponseWriter, request *http.Request) {
 	h.logger.Printf("task=%s target=%q available=%t duration_ms=%d", response.TaskID, response.Target, response.Result.Available, response.DurationMS)
 	if response.Result.SEO != nil {
 		r := response.Result.SEO
-		h.logger.Printf("seo task=%s domain=%q upstream_status=%d bytes=%d error=%q retry_at=%v", response.TaskID, response.Target, r.StatusCode, len(r.Body), r.Error, r.RetryAt)
+		h.logger.Printf("seo task=%s domain=%q upstream_status=%d bytes=%d error=%q source_blocked=%t retry_at=%v", response.TaskID, response.Target, r.StatusCode, len(r.Body), r.Error, r.SourceBlocked, r.RetryAt)
 	}
 	writeJSON(w, http.StatusOK, response)
 }
